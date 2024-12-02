@@ -1,0 +1,275 @@
+Parameters:
+  SlackWebhookUrlParameter:
+    Description: Slack Webhook URL
+    Type: String
+  ScheduleExpressionJSTParameter:
+    Description: Schedule Expression(JST)
+    Type: String
+    Default: 'cron(0 9 * * ? *)'
+  ScheduleEnabledParameter:
+    Description: Schedule Enable or Disable
+    Type: String
+    AllowedValues:
+      - ENABLED
+      - DISABLED
+Resources:
+  CostNotifySchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      ScheduleExpressionTimezone: Asia/Tokyo
+      ScheduleExpression : !Ref ScheduleExpressionJSTParameter
+      State: !Ref ScheduleEnabledParameter
+      Target:
+        Arn: !Ref MultiAccountCostNotifyStateMachine
+        RoleArn: !GetAtt ScheduleRole.Arn
+  MultiAccountCostNotifyStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      Definition:
+        Comment: 集計開始日、終了日(当月初日と現在日時)を返す。現在日時=当月初日の場合は、前月初日、前月末尾を返す
+        StartAt: EditDate
+        States:
+          EditDate:
+            Type: Pass
+            Output: |-
+              {% (
+                  $current := $fromMillis($toMillis($states.input.time) + 9*3600000, "[Y0001]-[M01]-[D01]");
+                  $first_of_month := $fromMillis($toMillis($states.input.time) + 9*3600000, "[Y0001]-[M01]-01");
+
+                  /* 当月のYM */
+                  $year := $number($substring($current, 0, 4));
+                  $month := $number($substring($current, 5, 2));
+              
+                  /* 前月のYM */ 
+                  $prevMonth := $month = 1 ? 12 : $month - 1;
+                  $prevYear := $month = 1 ? $year - 1 : $year;
+              
+                  /* 前月末日の計算 */
+                  $prev_month_end := (
+                      $lastDay := 
+                          $prevMonth in [4,6,9,11] ? "30" :
+                          $prevMonth = 2 ? 
+                              ($prevYear % 4 = 0 and ($prevYear % 100 != 0 or $prevYear % 400 = 0)) ? "29" : "28"
+                          : "31";
+                      $string($prevYear) & "-" & ($prevMonth < 10 ? "0" & $string($prevMonth) : $string($prevMonth)) & "-" & $lastDay
+                  );
+
+                  /* 前月月初日の計算 */
+                  $prev_month_start := (
+                      $string($prevYear) & "-" & ($prevMonth < 10 ? "0" & $string($prevMonth) : $string($prevMonth)) & "-01"
+                  );
+
+                  /* 条件分岐による出力 */
+                  $current = $first_of_month ? 
+                  {
+                      "start_date": $prev_month_start,
+                      "end_date": $prev_month_end
+                  } :
+                  {
+                      "start_date": $first_of_month,
+                      "end_date": $current
+                  }              
+              ) %}
+            Next: GetCostAndUsage
+          GetCostAndUsage:
+            Type: Task
+            Arguments:
+              Granularity: MONTHLY
+              Metrics:
+                - AmortizedCost
+              TimePeriod:
+                End: '{% $states.input.end_date %}'
+                Start: '{% $states.input.start_date %}'
+              GroupBy:
+                - Type: DIMENSION
+                  Key: LINKED_ACCOUNT
+                - Type: DIMENSION
+                  Key: SERVICE
+            Resource: arn:aws:states:::aws-sdk:costexplorer:getCostAndUsage
+            Next: GroupByAccounts
+            Assign:
+              start_date: '{% $states.input.start_date %}'
+              end_date: '{% $states.input.end_date %}'
+          GroupByAccounts:
+            Type: Pass
+            Output:
+              total: |-
+                {% (
+                        $rawTotal := $sum($states.input.ResultsByTime[0].Groups.Metrics.AmortizedCost.Amount ~> $map(function($v) { $number($v) }));
+                        /* Groupsが空配列を返す際の対策 */
+                        $total := $rawTotal ? $rawTotal : 0;
+                        $string($round($total * 100) / 100) & " USD"
+                    ) %}
+              accounts: |-
+                {% (
+                        $results := $states.input.ResultsByTime[0].Groups;
+                        $accounts := $states.input.DimensionValueAttributes;
+                        /* DimensionValueAttributesが空配列を返す際の対策 */
+                        $accounts ? (
+                            $accounts.{
+                                "accountId": $account := Value,
+                                "description": Attributes.description,
+                                "totalCost": (
+                                    $total := $sum($results[Keys[0] = $account].Metrics.AmortizedCost.Amount ~> $map(function($v) { $number($v) }));
+                                    $string($round($total * 100) / 100) & " USD"
+                                ),
+                                "services": $merge($results[Keys[0] = $account][
+                                    $number(Metrics.AmortizedCost.Amount) >= 0.01
+                                ].{
+                                    Keys[1]: $string($round($number(Metrics.AmortizedCost.Amount) * 100) / 100) & " " & Metrics.AmortizedCost.Unit
+                                })
+                            }
+                        ) : []
+                    ) %}
+            Next: Parallel
+            Assign: {}
+          Parallel:
+            Type: Parallel
+            Branches:
+              - StartAt: EditAllAccountTotalCost
+                States:
+                  EditAllAccountTotalCost:
+                    Type: Pass
+                    Output:
+                      account_total: >-
+                        {% $start_date & '〜' & $end_date & 'の請求額は、' &
+                        $states.input.total & 'です' %}
+                    Next: Call HTTPS APIs (All Account Total Cost)
+                  Call HTTPS APIs (All Account Total Cost):
+                    Type: Task
+                    Resource: arn:aws:states:::http:invoke
+                    Arguments:
+                      RequestBody:
+                        text: '{% $states.input.account_total %}'
+                      Authentication:
+                        ConnectionArn: !Sub ${PostSlackConnection.Arn}
+                      Method: POST
+                      ApiEndpoint: !Ref SlackWebhookUrlParameter
+                    Retry:
+                      - ErrorEquals:
+                          - States.ALL
+                        BackoffRate: 2
+                        IntervalSeconds: 1
+                        MaxAttempts: 3
+                        JitterStrategy: FULL
+                    End: true
+              - StartAt: Wait
+                States:
+                  Wait:
+                    Type: Wait
+                    Seconds: 2
+                    Next: AccountMap
+                  AccountMap:
+                    Type: Map
+                    ItemProcessor:
+                      ProcessorConfig:
+                        Mode: INLINE
+                      StartAt: EditPerAccount
+                      States:
+                        EditPerAccount:
+                          Type: Pass
+                          Output:
+                            attachments:
+                              - color: '#36a64f'
+                                text: >-
+                                  {% $each($states.input.services, function($v,
+                                  $k) {
+                                      "・" & $k & ": " & $v
+                                  }) ~> $join("\n") %}
+                                pretext: >-
+                                  {% $states.input.accountId & '(' &
+                                  $states.input.description & ')の請求額 : ' &
+                                  $states.input.totalCost %}
+                          Next: Call HTTPS APIs (Per Account Cost)
+                        Call HTTPS APIs (Per Account Cost):
+                          Type: Task
+                          Resource: arn:aws:states:::http:invoke
+                          Arguments:
+                            ApiEndpoint: !Ref SlackWebhookUrlParameter
+                            Method: POST
+                            Authentication:
+                              ConnectionArn: !Sub ${PostSlackConnection.Arn}
+                            RequestBody: '{% $states.input %}'
+                          Retry:
+                            - ErrorEquals:
+                                - States.ALL
+                              BackoffRate: 2
+                              IntervalSeconds: 1
+                              MaxAttempts: 3
+                              JitterStrategy: FULL
+                          End: true
+                    Items: '{% $states.input.accounts %}'
+                    End: true
+                    MaxConcurrency: 1
+            End: true
+        QueryLanguage: JSONata
+      RoleArn: !GetAtt StateMachineRole.Arn
+      StateMachineName: MultiAccountCostNotifyStateMachine
+      StateMachineType: STANDARD
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StateMachinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                Resource:
+                  - '*'
+              - Effect: Allow
+                Action: ce:GetCostAndUsage
+                Resource: '*'
+              - Effect: Allow
+                Action: states:InvokeHTTPEndpoint
+                Resource: '*'
+              - Effect: Allow
+                Action: events:RetrieveConnectionCredentials
+                Resource: !Sub ${PostSlackConnection.Arn}
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:events!connection/${PostSlackConnection}/*"
+      MaxSessionDuration: 3600
+  ScheduleRole:
+    Type : 'AWS::IAM::Role'
+    Properties :
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SchedulePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref MultiAccountCostNotifyStateMachine
+  PostSlackConnection:
+    Type: AWS::Events::Connection
+    Properties:
+      AuthorizationType: API_KEY
+      AuthParameters:
+        ApiKeyAuthParameters:
+          ApiKeyName: "dummy"
+          ApiKeyValue: "dummy"
+      Description: Slack Webhook
