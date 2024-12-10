@@ -120,7 +120,7 @@ Resources:
                                 ].{
                                     Keys[1]: $string($round($number(Metrics.AmortizedCost.Amount) * 100) / 100) & " " & Metrics.AmortizedCost.Unit
                                 })
-                            }
+                            }[]
                         ) : []
                     ) %}
             Next: Parallel
